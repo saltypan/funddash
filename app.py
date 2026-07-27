@@ -14,59 +14,45 @@ st.set_page_config(page_title="个人投资理财看板", layout="wide")
 st.title("📈 个人投资看板 & 实时追踪")
 
 if not os.path.exists('transactions.csv'):
-    df_init = pd.DataFrame(columns=['date', 'code', 'name', 'type', 'nav', 'amount', 'shares', 'fee'])
+    df_init = pd.DataFrame(columns=['date', 'platform', 'code', 'name', 'type', 'nav', 'amount', 'shares', 'fee'])
     df_init.to_csv('transactions.csv', index=False)
 
 # ==========================================
-# 2. 侧边栏：录入新交易表单
-# ==========================================
-with st.sidebar:
-    st.header("➕ 录入新交易")
-    with st.form("new_transaction_form", clear_on_submit=True):
-        t_date = st.date_input("交易日期", datetime.now())
-        t_code = st.text_input("标的代码 (如 600519 或 110007)")
-        t_name = st.text_input("标的名称")
-        t_type = st.selectbox("交易类型", ["BUY", "SELL", "FEE"])
-        t_nav = st.number_input("成交净值/单价", min_value=0.0000, step=0.0010, format="%.4f")
-        t_amount = st.number_input("发生金额 (元)", min_value=0.0, step=100.0)
-        t_shares = st.number_input("成交份额", min_value=0.0, step=1.0)
-        t_fee = st.number_input("手续费 (元)", min_value=0.0, step=1.0)
-        
-        submitted = st.form_submit_button("提交记录")
-        
-        if submitted:
-            if t_code and t_name and t_amount >= 0:
-                new_record = pd.DataFrame([{
-                    'date': t_date.strftime('%Y-%m-%d'),
-                    'code': str(t_code).strip().zfill(6),
-                    'name': t_name.strip(),
-                    'type': t_type,
-                    'nav': t_nav,
-                    'amount': t_amount,
-                    'shares': t_shares,
-                    'fee': t_fee
-                }])
-                new_record.to_csv('transactions.csv', mode='a', header=False, index=False)
-                st.success("✅ 交易记录已保存！")
-                st.cache_data.clear() 
-                st.rerun()            
-            else:
-                st.error("⚠️ 请确保填写了代码、名称，且金额正确。")
-
-# ==========================================
-# 3. 数据读取与行情获取 
+# 2. 核心数据与函数定义 (前置定义供侧边栏调用)
 # ==========================================
 @st.cache_data(ttl=60)
 def load_transactions():
     df = pd.read_csv('transactions.csv')
     df['date'] = pd.to_datetime(df['date'])
     df['code'] = df['code'].astype(str).str.zfill(6)
-    if 'nav' not in df.columns:
-        df['nav'] = df.apply(lambda row: row['amount'] / row['shares'] if row.get('shares', 0) > 0 else 0.0, axis=1)
-    df['nav'] = df['nav'].fillna(0.0)
     return df
 
 transactions = load_transactions()
+
+@st.cache_data(ttl=3600)
+def get_history_data(code):
+    code_str = str(code).strip().zfill(6)
+    df = pd.DataFrame()
+    try:
+        df_fund = ef.fund.get_quote_history(code_str)
+        if df_fund is not None and not df_fund.empty:
+            df = df_fund.rename(columns={'日期': 'date', '单位净值': 'nav', '收盘': 'nav'})
+            if 'nav' not in df.columns and '累计净值' in df.columns:
+                df['nav'] = df['累计净值']
+    except: pass
+    
+    if df.empty or 'nav' not in df.columns:
+        try:
+            df_stock = ef.stock.get_quote_history(code_str)
+            if df_stock is not None and not df_stock.empty:
+                df = df_stock.rename(columns={'日期': 'date', '收盘': 'nav'})
+        except: pass
+
+    if not df.empty and 'date' in df.columns and 'nav' in df.columns:
+        df['date'] = pd.to_datetime(df['date']).dt.date
+        df['nav'] = pd.to_numeric(df['nav'], errors='coerce')
+        return df[['date', 'nav']].sort_values('date').dropna()
+    return pd.DataFrame(columns=['date', 'nav'])
 
 @st.cache_data(ttl=300) 
 def get_live_prices(codes):
@@ -104,59 +90,155 @@ def get_live_prices(codes):
         except: pass
     return prices
 
-@st.cache_data(ttl=3600)
-def get_history_data(code):
-    code_str = str(code).strip().zfill(6)
-    df = pd.DataFrame()
-    try:
-        df_fund = ef.fund.get_quote_history(code_str)
-        if df_fund is not None and not df_fund.empty:
-            df = df_fund.rename(columns={'日期': 'date', '单位净值': 'nav', '收盘': 'nav'})
-            if 'nav' not in df.columns and '累计净值' in df.columns:
-                df['nav'] = df['累计净值']
-    except: pass
+# ==========================================
+# 3. 侧边栏：全局看板筛选 & 智能全自动录入系统
+# ==========================================
+with st.sidebar:
+    st.header("🔎 全局看板筛选")
+    existing_platforms = list(transactions['platform'].dropna().unique())
+    platforms_options = ["全盘总览"] + existing_platforms
+    selected_platform = st.selectbox("选择要查看的平台/账户", platforms_options)
     
-    if df.empty or 'nav' not in df.columns:
-        try:
-            df_stock = ef.stock.get_quote_history(code_str)
-            if df_stock is not None and not df_stock.empty:
-                df = df_stock.rename(columns={'日期': 'date', '收盘': 'nav'})
-        except: pass
+    st.divider()
+    st.header("➕ 录入新交易 (智能助手)")
+    
+    t_date = st.date_input("交易日期 (自动匹配当日净值)", datetime.now())
+    t_code = st.text_input("标的代码 (输入代码并回车)", key="input_code")
+    code_str = str(t_code).strip().zfill(6) if t_code else ""
+    
+    auto_name = ""
+    auto_nav = 0.0000
+    
+    if code_str:
+        history_match = transactions[transactions['code'] == code_str]
+        if not history_match.empty:
+            auto_name = history_match['name'].iloc[0]
+        else:
+            try:
+                q = ef.stock.get_realtime_quotes(code_str)
+                if q is not None and not q.empty: auto_name = q['股票名称'].iloc[0]
+            except: pass
+            if not auto_name:
+                try:
+                    url = f"http://fundsuggest.eastmoney.com/FundSearch/api/FundSearchAPI.ashx?m=1&key={code_str}"
+                    res = requests.get(url, timeout=3).json()
+                    if res.get("Datas"): auto_name = res["Datas"][0]["NAME"]
+                except: pass
+                
+        hist_nav_df = get_history_data(code_str)
+        if not hist_nav_df.empty:
+            match_nav = hist_nav_df[hist_nav_df['date'] == t_date]
+            if not match_nav.empty:
+                auto_nav = float(match_nav['nav'].iloc[0])
+            else:
+                past_navs = hist_nav_df[hist_nav_df['date'] <= t_date]
+                if not past_navs.empty:
+                    auto_nav = float(past_navs.iloc[-1]['nav'])
 
-    if not df.empty and 'date' in df.columns and 'nav' in df.columns:
-        df['date'] = pd.to_datetime(df['date']).dt.date
-        df['nav'] = pd.to_numeric(df['nav'], errors='coerce')
-        return df[['date', 'nav']].sort_values('date').dropna()
-    return pd.DataFrame(columns=['date', 'nav'])
+    t_platform = st.selectbox("交易平台", ["东方财富", "天天基金", "支付宝", "招商银行", "微众银行", "华泰证券", "其他"])
+    t_name = st.text_input("标的名称", value=auto_name)
+    t_type = st.selectbox("交易类型", ["BUY", "SELL", "FEE", "DIVIDEND"])
+    
+    col1, col2 = st.columns([6, 4])
+    with col1:
+        t_amount = st.number_input("发生金额 (元)", min_value=0.0, step=100.0, value=0.0)
+    with col2:
+        fee_rate = st.number_input("费率估算(%)", value=0.15, step=0.01) / 100.0
+        
+    auto_fee = round(t_amount * fee_rate, 2) if t_type == "BUY" and t_amount > 0 else 0.0
+    auto_shares = 0.0
+    if auto_nav > 0 and t_type == "BUY":
+        auto_shares = round((t_amount - auto_fee) / auto_nav, 2)
+    elif auto_nav > 0 and t_type == "SELL":
+        auto_shares = round(t_amount / auto_nav, 2)
 
-unique_codes = list(transactions['code'].unique())
+    t_nav = st.number_input("成交净值/单价", min_value=0.0000, step=0.0010, format="%.4f", value=float(auto_nav))
+    t_shares = st.number_input("成交份额", min_value=0.0, step=1.0, value=float(auto_shares))
+    t_fee = st.number_input("手续费 (元)", min_value=0.0, step=1.0, value=float(auto_fee))
+    
+    submitted = st.button("✅ 提交记录", use_container_width=True)
+    
+    if submitted:
+        if code_str and t_name and t_amount > 0:
+            new_record = pd.DataFrame([{
+                'date': t_date.strftime('%Y-%m-%d'),
+                'platform': t_platform.strip(),
+                'code': code_str,
+                'name': t_name.strip(),
+                'type': t_type,
+                'nav': t_nav,
+                'amount': t_amount,
+                'shares': t_shares,
+                'fee': t_fee
+            }])
+            
+            # 强制剔除时间尾巴并写入
+            updated_transactions = pd.concat([transactions, new_record], ignore_index=True)
+            updated_transactions['date'] = pd.to_datetime(updated_transactions['date']).dt.strftime('%Y-%m-%d')
+            updated_transactions.to_csv('transactions.csv', index=False)
+            
+            st.success(f"✅ {t_name} 交易记录已保存！")
+            st.session_state.input_code = "" 
+            st.cache_data.clear() 
+            st.rerun()            
+        else:
+            st.error("⚠️ 请确保填写了代码、名称，且金额必须大于0。")
+
+# ==========================================
+# 4. 根据侧边栏筛选器拦截数据
+# ==========================================
+if selected_platform == "全盘总览":
+    filtered_trans = transactions.copy()
+    display_title_suffix = "(全盘)"
+else:
+    filtered_trans = transactions[transactions['platform'] == selected_platform].copy()
+    display_title_suffix = f"({selected_platform})"
+
+unique_codes = list(filtered_trans['code'].unique())
 live_prices = get_live_prices(unique_codes)
 
 # ==========================================
-# 4. 计算持仓明细、XIRR 与今日收益
+# 5. 核心逻辑：份额摊薄法计算纯本金、单列手续费
 # ==========================================
 holdings = {}
 cash_flows = []
+filtered_trans = filtered_trans.sort_values(by='date')
 
-for _, row in transactions.iterrows():
+for _, row in filtered_trans.iterrows():
     c_date = row['date'].date()
     c_type = row['type']
     c_amount = float(row['amount'])
     c_fee = float(row['fee'])
+    c_shares = float(row['shares'])
     c_code = str(row['code']).zfill(6)
     c_name = row['name']
     
     if c_code not in holdings:
-        holdings[c_code] = {'name': c_name, 'shares': 0.0, 'total_cost': 0.0}
+        holdings[c_code] = {'name': c_name, 'shares': 0.0, 'pure_cost': 0.0, 'total_fee': 0.0}
     
     if c_type == 'BUY':
-        cash_flows.append((c_date, -(c_amount + c_fee)))
-        holdings[c_code]['shares'] += float(row['shares'])
-        holdings[c_code]['total_cost'] += (c_amount + c_fee)
+        # 纯本金仅计入剔除手续费后的实际投入份额价值
+        pure_in = c_amount - c_fee
+        cash_flows.append((c_date, -pure_in))
+        holdings[c_code]['shares'] += c_shares
+        holdings[c_code]['pure_cost'] += pure_in
+        holdings[c_code]['total_fee'] += c_fee
+        
     elif c_type == 'SELL':
-        cash_flows.append((c_date, c_amount - c_fee))
-        holdings[c_code]['shares'] -= float(row['shares'])
-        holdings[c_code]['total_cost'] -= (c_amount - c_fee)
+        # 卖出时，根据份额比例等比核减持仓本金
+        pure_out = c_amount + c_fee
+        cash_flows.append((c_date, pure_out))
+        
+        avg_cost = holdings[c_code]['pure_cost'] / holdings[c_code]['shares'] if holdings[c_code]['shares'] > 0 else 0
+        holdings[c_code]['shares'] -= c_shares
+        holdings[c_code]['pure_cost'] -= c_shares * avg_cost
+        
+        # 避免浮点数导致清仓后残留小数点
+        if holdings[c_code]['shares'] <= 0.001:
+            holdings[c_code]['pure_cost'] = 0.0
+            holdings[c_code]['shares'] = 0.0
+            
+        holdings[c_code]['total_fee'] += c_fee
 
 total_market_value = 0.0
 total_today_profit = 0.0
@@ -173,43 +255,48 @@ for code, info in holdings.items():
     total_market_value += market_val
     total_today_profit += today_profit
     
-    profit = market_val - info['total_cost']
-    profit_rate = (profit / info['total_cost'] * 100) if info['total_cost'] > 0 else 0.0
-    avg_cost = info['total_cost'] / info['shares'] if info['shares'] > 0 else 0.0
+    profit = market_val - info['pure_cost']
+    profit_rate = (profit / info['pure_cost'] * 100) if info['pure_cost'] > 0 else 0.0
+    avg_cost = info['pure_cost'] / info['shares'] if info['shares'] > 0 else 0.0
     
     holding_rows.append({
         "标的代码": code, "标的名称": info['name'], "持仓份额": info['shares'],
         "购买均价": avg_cost, "最新单价": current_price, "当前市值": market_val,
-        "持仓本金": info['total_cost'], "持有收益": profit, "收益率": profit_rate, "今日收益": today_profit
+        "持仓本金": info['pure_cost'], "累计手续费": info['total_fee'], 
+        "纯持有收益": profit, "收益率": profit_rate, "今日收益": today_profit
     })
 
 cash_flows.append((datetime.now().date(), total_market_value))
 try:
-    portfolio_xirr = xirr(cash_flows)
+    portfolio_xirr = xirr(cash_flows) if len(cash_flows) > 1 else None
     xirr_display = f"{portfolio_xirr * 100:.2f}%" if portfolio_xirr is not None else "数据不足"
 except: xirr_display = "等待更多数据"
 
-total_cost_all = sum(info['total_cost'] for info in holdings.values() if info['shares'] > 0.001)
-total_cumulative_profit = total_market_value - total_cost_all
+total_pure_cost_all = sum(info['pure_cost'] for info in holdings.values() if info['shares'] > 0.001)
+total_fee_all = sum(info['total_fee'] for info in holdings.values() if info['shares'] > 0.001)
+total_cumulative_profit = total_market_value - total_pure_cost_all
 yesterday_market_value = total_market_value - total_today_profit
 today_return_rate = (total_today_profit / yesterday_market_value) * 100 if yesterday_market_value > 0 else 0.0
 
 # ==========================================
-# 5. 渲染顶部核心数据区与全盘回溯走势图
+# 6. 渲染顶部核心数据区与回溯走势图
 # ==========================================
-col1, col2, col3, col4, col5 = st.columns(5)
+st.markdown(f"### 📊 核心指标 {display_title_suffix}")
+# 新增第六列展示单列的累计手续费
+col1, col2, col3, col4, col5, col6 = st.columns(6)
 col1.metric("持仓总市值", f"¥ {total_market_value:,.2f}")
-col2.metric("累计投入本金", f"¥ {total_cost_all:,.2f}")
-col3.metric("全盘累计收益", f"¥ {total_cumulative_profit:,.2f}", f"{total_cumulative_profit/total_cost_all*100:+.2f}%" if total_cost_all>0 else "0%", delta_color="inverse")
-col4.metric("今日全盘收益", f"¥ {total_today_profit:,.2f}", f"{today_return_rate:+.2f}%", delta_color="inverse")
-col5.metric("XIRR 年化收益率", xirr_display)
+col2.metric("持仓总本金 (纯)", f"¥ {total_pure_cost_all:,.2f}")
+col3.metric("累计收益 (纯)", f"¥ {total_cumulative_profit:,.2f}", f"{total_cumulative_profit/total_pure_cost_all*100:+.2f}%" if total_pure_cost_all>0 else "0%", delta_color="inverse")
+col4.metric("今日收益", f"¥ {total_today_profit:,.2f}", f"{today_return_rate:+.2f}%", delta_color="inverse")
+col5.metric("累计手续费", f"¥ {total_fee_all:,.2f}")
+col6.metric("纯资产 XIRR", xirr_display)
 
-st.markdown("### 📈 资产与收益历史走势")
+st.markdown(f"### 📈 资产与收益历史走势 {display_title_suffix}")
 tab1, tab2 = st.tabs(["累计收益走势", "总资产走势"])
 
-with st.spinner('正在基于历史流水进行全盘核算...'):
-    if not transactions.empty:
-        min_date = transactions['date'].min().date()
+with st.spinner('正在基于摊薄成本法核算历史走势...'):
+    if not filtered_trans.empty:
+        min_date = filtered_trans['date'].min().date()
         today_date = datetime.now().date()
         port_timeline = pd.DataFrame({'date': pd.date_range(min_date, today_date).date})
         
@@ -218,28 +305,41 @@ with st.spinner('正在基于历史流水进行全盘核算...'):
         
         for code in unique_codes:
             hist_nav = get_history_data(code)
-            code_trans = transactions[transactions['code'] == code].copy()
+            code_trans = filtered_trans[filtered_trans['code'] == code].copy()
             code_trans['date'] = code_trans['date'].dt.date
             
-            daily_trans = code_trans.groupby('date').apply(
-                lambda x: pd.Series({
-                    'buy_shares': x[x['type']=='BUY']['shares'].sum() - x[x['type']=='SELL']['shares'].sum(),
-                    'buy_cost': x[x['type']=='BUY'].apply(lambda r: r['amount']+r['fee'], axis=1).sum() - x[x['type']=='SELL'].apply(lambda r: r['amount']-r['fee'], axis=1).sum()
-                })
-            ).reset_index()
+            # 使用增量遍历法完美复刻历史摊薄成本
+            records = []
+            cur_sh = 0.0
+            cur_cost = 0.0
+            for dt, grp in code_trans.groupby('date'):
+                for _, r in grp.iterrows():
+                    amt = float(r['amount'])
+                    fee = float(r['fee'])
+                    sh = float(r['shares'])
+                    if r['type'] == 'BUY':
+                        cur_sh += sh
+                        cur_cost += (amt - fee)
+                    elif r['type'] == 'SELL':
+                        avg_c = cur_cost / cur_sh if cur_sh > 0 else 0
+                        cur_sh -= sh
+                        cur_cost -= sh * avg_c
+                        if cur_sh <= 0.001: cur_cost = 0.0
+                records.append({'date': dt, 'shares': cur_sh, 'pure_cost': cur_cost})
             
-            code_timeline = pd.merge(port_timeline[['date']], daily_trans, on='date', how='left').fillna(0)
-            code_timeline['cum_shares'] = code_timeline['buy_shares'].cumsum()
-            code_timeline['cum_cost'] = code_timeline['buy_cost'].cumsum()
+            df_state = pd.DataFrame(records)
+            code_timeline = pd.merge(port_timeline[['date']], df_state, on='date', how='left')
+            code_timeline['shares'] = code_timeline['shares'].ffill().fillna(0)
+            code_timeline['pure_cost'] = code_timeline['pure_cost'].ffill().fillna(0)
             
             if not hist_nav.empty:
                 code_timeline = pd.merge(code_timeline, hist_nav, on='date', how='left')
                 code_timeline['nav'] = code_timeline['nav'].ffill().bfill()
             else:
-                code_timeline['nav'] = 1.0 # 如果完全获取不到历史净值的兜底处理
+                code_timeline['nav'] = 1.0 
                 
-            port_timeline['total_val'] += code_timeline['cum_shares'] * code_timeline['nav']
-            port_timeline['total_cost'] += code_timeline['cum_cost']
+            port_timeline['total_val'] += code_timeline['shares'] * code_timeline['nav']
+            port_timeline['total_cost'] += code_timeline['pure_cost']
         
         port_timeline['total_profit'] = port_timeline['total_val'] - port_timeline['total_cost']
         port_timeline.set_index('date', inplace=True)
@@ -247,10 +347,10 @@ with st.spinner('正在基于历史流水进行全盘核算...'):
         with tab1: st.line_chart(port_timeline['total_profit'], use_container_width=True)
         with tab2: st.area_chart(port_timeline['total_val'], use_container_width=True)
     else:
-        st.info("暂无交易记录，无法绘制走势图")
+        st.info("该平台暂无交易记录，无法绘制走势图")
 
 # ==========================================
-# 6. 渲染表格通用样式
+# 7. 渲染表格通用样式
 # ==========================================
 center_css = [dict(selector="th", props=[("text-align", "center")]), dict(selector="td", props=[("text-align", "center")])]
 def color_red_green(val):
@@ -259,16 +359,16 @@ def color_red_green(val):
         elif val < 0: return 'color: #09ab3b; font-weight: bold;'
     return ''
 
-st.subheader("📊 当前持仓与实时盈亏")
+st.subheader(f"📊 当前持仓与实时盈亏 {display_title_suffix}")
 if holding_rows:
     df_holdings = pd.DataFrame(holding_rows)
     styled_holdings = df_holdings.style.format({
         "持仓份额": "{:,.2f}", "购买均价": "{:,.4f}", "最新单价": "{:,.4f}", "当前市值": "¥ {:,.2f}",
-        "持仓本金": "¥ {:,.2f}", "持有收益": "¥ {:,.2f}", "收益率": "{:+.2f}%", "今日收益": "¥ {:+.2f}"
+        "持仓本金": "¥ {:,.2f}", "累计手续费": "¥ {:,.2f}", "纯持有收益": "¥ {:,.2f}", "收益率": "{:+.2f}%", "今日收益": "¥ {:+.2f}"
     })
     
-    try: styled_holdings = styled_holdings.map(color_red_green, subset=["持有收益", "收益率", "今日收益"])
-    except AttributeError: styled_holdings = styled_holdings.applymap(color_red_green, subset=["持有收益", "收益率", "今日收益"])
+    try: styled_holdings = styled_holdings.map(color_red_green, subset=["纯持有收益", "收益率", "今日收益"])
+    except AttributeError: styled_holdings = styled_holdings.applymap(color_red_green, subset=["纯持有收益", "收益率", "今日收益"])
         
     styled_holdings = styled_holdings.set_table_styles(center_css)
     st.dataframe(styled_holdings, use_container_width=True)
@@ -276,11 +376,11 @@ else:
     st.info("暂无持仓记录或已全部清仓")
 
 # ==========================================
-# 7. 单标的下钻深度分析 
+# 8. 单标的下钻深度分析 
 # ==========================================
 if holding_rows:
     st.divider()
-    st.subheader("🔍 单只标的下钻分析")
+    st.subheader(f"🔍 单只标的下钻分析 {display_title_suffix}")
     
     selected_name = st.selectbox("选择要分析的持仓标的", [row['标的名称'] for row in holding_rows])
     selected_code = next(row['标的代码'] for row in holding_rows if row['标的名称'] == selected_name)
@@ -289,23 +389,35 @@ if holding_rows:
         hist_nav = get_history_data(selected_code)
         
         if not hist_nav.empty:
-            code_trans = transactions[transactions['code'] == selected_code].copy()
+            code_trans = filtered_trans[filtered_trans['code'] == selected_code].copy()
             code_trans['date'] = pd.to_datetime(code_trans['date']).dt.date
             
             min_date = code_trans['date'].min()
             today_date = datetime.now().date()
             timeline = pd.DataFrame({'date': pd.date_range(min_date, today_date).date})
             
-            daily_trans = code_trans.groupby('date').apply(
-                lambda x: pd.Series({
-                    'buy_shares': x[x['type']=='BUY']['shares'].sum() - x[x['type']=='SELL']['shares'].sum(),
-                    'buy_cost': x[x['type']=='BUY'].apply(lambda r: r['amount']+r['fee'], axis=1).sum() - x[x['type']=='SELL'].apply(lambda r: r['amount']-r['fee'], axis=1).sum()
-                })
-            ).reset_index()
+            records = []
+            cur_sh = 0.0
+            cur_cost = 0.0
+            for dt, grp in code_trans.groupby('date'):
+                for _, r in grp.iterrows():
+                    amt = float(r['amount'])
+                    fee = float(r['fee'])
+                    sh = float(r['shares'])
+                    if r['type'] == 'BUY':
+                        cur_sh += sh
+                        cur_cost += (amt - fee)
+                    elif r['type'] == 'SELL':
+                        avg_c = cur_cost / cur_sh if cur_sh > 0 else 0
+                        cur_sh -= sh
+                        cur_cost -= sh * avg_c
+                        if cur_sh <= 0.001: cur_cost = 0.0
+                records.append({'date': dt, 'cum_shares': cur_sh, 'cum_cost': cur_cost})
             
-            timeline = pd.merge(timeline, daily_trans, on='date', how='left').fillna(0)
-            timeline['cum_shares'] = timeline['buy_shares'].cumsum()
-            timeline['cum_cost'] = timeline['buy_cost'].cumsum()
+            df_state = pd.DataFrame(records)
+            timeline = pd.merge(timeline, df_state, on='date', how='left')
+            timeline['cum_shares'] = timeline['cum_shares'].ffill().fillna(0)
+            timeline['cum_cost'] = timeline['cum_cost'].ffill().fillna(0)
             
             timeline = pd.merge(timeline, hist_nav, on='date', how='left')
             timeline['nav'] = timeline['nav'].ffill().bfill() 
@@ -317,7 +429,7 @@ if holding_rows:
                 st.markdown("##### 📈 历史净值走势")
                 st.line_chart(timeline.set_index('date')['nav'], use_container_width=True)
             with d_col2:
-                st.markdown("##### 💰 累计收益走势")
+                st.markdown("##### 💰 累计纯收益走势")
                 st.area_chart(timeline.set_index('date')['profit'], use_container_width=True)
                 
             st.markdown("##### 📅 月度收益变化日历 (元)")
@@ -342,9 +454,9 @@ if holding_rows:
             st.warning("暂无该标的的历史净值数据，可能接口限制或代码类型不受支持。")
 
 st.divider()
-st.subheader("📝 历史交易流水 (含数据校验)")
-if not transactions.empty:
-    df_trans = transactions.sort_values(by="date", ascending=False).copy()
+st.subheader(f"📝 历史交易流水 {display_title_suffix}")
+if not filtered_trans.empty:
+    df_trans = filtered_trans.sort_values(by="date", ascending=False).copy()
     df_trans['date'] = df_trans['date'].dt.strftime('%Y-%m-%d')
     
     def verify_data(row):
@@ -355,8 +467,12 @@ if not transactions.empty:
         return "✅ 账实相符" if abs(diff) <= 0.05 else f"⚠️ 误差 {diff:+.2f} 元"
 
     df_trans['数据校对'] = df_trans.apply(verify_data, axis=1)
-    df_trans = df_trans[['date', 'code', 'name', 'type', 'nav', 'amount', 'shares', 'fee', '数据校对']]
-    df_trans = df_trans.rename(columns={'date': '交易日期', 'code': '标的代码', 'name': '标的名称', 'type': '交易类型', 'nav': '成交净值', 'amount': '发生金额', 'shares': '成交份额', 'fee': '手续费'})
+    
+    df_trans = df_trans[['date', 'platform', 'code', 'name', 'type', 'nav', 'amount', 'shares', 'fee', '数据校对']]
+    df_trans = df_trans.rename(columns={
+        'date': '交易日期', 'platform': '交易平台', 'code': '标的代码', 'name': '标的名称', 
+        'type': '交易类型', 'nav': '成交净值', 'amount': '发生金额', 'shares': '成交份额', 'fee': '手续费'
+    })
     
     styled_trans = df_trans.style.format({"成交净值": "{:,.4f}", "发生金额": "¥ {:,.2f}", "成交份额": "{:,.2f}", "手续费": "¥ {:,.2f}"}).set_table_styles(center_css)
     st.dataframe(styled_trans, use_container_width=True)
