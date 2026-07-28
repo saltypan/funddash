@@ -1,4 +1,5 @@
 transactions.csv
+transactions copy.csv
 .venv/
 __pycache__/
 .DS_Store
