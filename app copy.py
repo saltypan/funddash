@@ -1,5 +1,3 @@
-# 更新时间 / 2024-06-26 23:00
-
 import streamlit as st
 import pandas as pd
 import efinance as ef
@@ -197,7 +195,6 @@ unique_codes = list(filtered_trans['code'].unique())
 live_prices = get_live_prices(unique_codes)
 
 holdings = {}
-realized_pnl = {} # 用于记录每只基金的历史已实现盈亏
 cash_flows = []
 filtered_trans = filtered_trans.sort_values(by='date')
 
@@ -211,38 +208,21 @@ for _, row in filtered_trans.iterrows():
     c_name = row['name']
     
     if c_code not in holdings:
-        holdings[c_code] = {
-            'name': c_name, 'shares': 0.0, 'pure_cost': 0.0, 
-            'total_fee': 0.0, 'total_div': 0.0,
-            'first_buy': None, 'cf': [], 'total_buy_cost': 0.0
-        }
-        realized_pnl[c_code] = 0.0
+        holdings[c_code] = {'name': c_name, 'shares': 0.0, 'pure_cost': 0.0, 'total_fee': 0.0, 'total_div': 0.0}
     
     if c_type == 'BUY':
-        if holdings[c_code]['first_buy'] is None:
-            holdings[c_code]['first_buy'] = c_date
-            
         pure_in = c_amount - c_fee
         cash_flows.append((c_date, -pure_in))
-        holdings[c_code]['cf'].append((c_date, -pure_in))
         holdings[c_code]['shares'] += c_shares
         holdings[c_code]['pure_cost'] += pure_in
-        holdings[c_code]['total_buy_cost'] += pure_in  
         holdings[c_code]['total_fee'] += c_fee
         
     elif c_type == 'SELL':
         pure_out = c_amount + c_fee
         cash_flows.append((c_date, pure_out))
-        holdings[c_code]['cf'].append((c_date, pure_out))
-        
         avg_cost = holdings[c_code]['pure_cost'] / holdings[c_code]['shares'] if holdings[c_code]['shares'] > 0 else 0
-        cost_sold = c_shares * avg_cost
-        
-        trade_pnl = (c_amount - c_fee) - cost_sold
-        realized_pnl[c_code] += trade_pnl
-        
         holdings[c_code]['shares'] -= c_shares
-        holdings[c_code]['pure_cost'] -= cost_sold
+        holdings[c_code]['pure_cost'] -= c_shares * avg_cost
         
         if holdings[c_code]['shares'] <= 0.001:
             holdings[c_code]['pure_cost'] = 0.0
@@ -251,137 +231,32 @@ for _, row in filtered_trans.iterrows():
         
     elif c_type == 'DIVIDEND':
         cash_flows.append((c_date, c_amount))
-        holdings[c_code]['cf'].append((c_date, c_amount))
         holdings[c_code]['total_div'] += c_amount
 
 total_market_value = 0.0
 total_today_profit = 0.0
 holding_rows = []
 
-# 生成动态日期角标
-today_d = datetime.now().date()
-yest_d = today_d - timedelta(days=1)
-today_str = today_d.strftime("%m-%d")
-yest_str = yest_d.strftime("%m-%d")
-
-col_today_profit = f"今日收益({today_str})"
-col_today_rate = f"今日收益率({today_str})"
-col_yest_profit = f"昨日收益({yest_str})"
-col_yest_rate = f"昨日收益率({yest_str})"
-
 for code, info in holdings.items():
-    if info['shares'] <= 0.001 and info['total_div'] == 0 and realized_pnl.get(code, 0.0) == 0: 
-        continue
+    if info['shares'] <= 0.001 and info['total_div'] == 0: continue
         
     market_data = live_prices.get(code, {'price': 0.0, 'change_rate': 0.0, 'change_amount': 0.0})
     current_price = market_data['price']
     market_val = info['shares'] * current_price
+    today_profit = info['shares'] * market_data['change_amount']
     
-    today_profit = 0.0
-    today_profit_rate = 0.0
-    yesterday_profit = 0.0
-    yesterday_profit_rate = 0.0
-    mdd = 0.0
-    twr = 0.0
-    
-    hist = get_history_data(code)
-    
-    # --- 强时间戳校验：精准核算昨日与今日 ---
-    if not hist.empty:
-        hist = hist.copy()
-        hist['prev_nav'] = hist['nav'].shift(1)
-        hist['change_amt'] = hist['nav'] - hist['prev_nav']
-        hist['change_rate'] = (hist['change_amt'] / hist['prev_nav']) * 100
-        
-        last_row = hist.iloc[-1]
-        last_hist_date = last_row['date']
-        
-        # 1. 匹配今日收益
-        if last_hist_date == today_d:
-            # 基金历史净值已经更新到了今天
-            today_profit = info['shares'] * float(last_row['change_amt']) if pd.notna(last_row['change_amt']) else 0.0
-            today_profit_rate = float(last_row['change_rate']) if pd.notna(last_row['change_rate']) else 0.0
-        elif last_hist_date < today_d and abs(current_price - float(last_row['nav'])) > 0.0001:
-            # 历史还是昨天的，但实时拉取的现价变了（说明是盘中正在交易的 ETF 或 股票）
-            today_profit = info['shares'] * market_data['change_amount']
-            today_profit_rate = market_data['change_rate']
-        else:
-            # 未更新数据的场外基金，强制归零
-            today_profit = 0.0
-            today_profit_rate = 0.0
-            
-        # 2. 匹配昨日收益 (严格按日期在历史库中寻找)
-        yest_mask = hist['date'] == yest_d
-        if yest_mask.any():
-            yest_row = hist[yest_mask].iloc[0]
-            if pd.notna(yest_row['change_amt']):
-                yesterday_profit = info['shares'] * float(yest_row['change_amt'])
-                yesterday_profit_rate = float(yest_row['change_rate'])
-                
-        # 3. TWR 与 最大回撤
-        if info['first_buy']:
-            hist_held = hist[hist['date'] >= info['first_buy']].copy()
-            if not hist_held.empty:
-                hist_held['peak'] = hist_held['nav'].cummax()
-                hist_held['drawdown'] = (hist_held['nav'] - hist_held['peak']) / hist_held['peak']
-                mdd = float(hist_held['drawdown'].min() * 100)
-                
-                first_nav = float(hist_held.iloc[0]['nav'])
-                if first_nav > 0:
-                    twr = ((current_price / first_nav) - 1) * 100
-    else:
-        # 兜底逻辑
-        if current_price > 0:
-            today_profit = info['shares'] * market_data['change_amount']
-            today_profit_rate = market_data['change_rate']
-
     total_market_value += market_val
     total_today_profit += today_profit
     
-    holding_profit = market_val - info['pure_cost'] + info['total_div']
-    total_history_profit = holding_profit + realized_pnl.get(code, 0.0)
-    
-    profit_rate = (holding_profit / info['pure_cost'] * 100) if info['pure_cost'] > 0 else 0.0
-    total_history_rate = (total_history_profit / info['total_buy_cost'] * 100) if info['total_buy_cost'] > 0 else 0.0
+    profit = market_val - info['pure_cost'] + info['total_div']
+    profit_rate = (profit / info['pure_cost'] * 100) if info['pure_cost'] > 0 else 0.0
     avg_cost = info['pure_cost'] / info['shares'] if info['shares'] > 0 else 0.0
     
-    days_held = (datetime.now().date() - info['first_buy']).days if info['first_buy'] else 0
-    days_held = max(1, days_held)
-    
-    base = 1 + profit_rate / 100
-    annualized_rate = (base ** (365 / days_held) - 1) * 100 if base > 0 else -100.0
-        
-    h_cf = info['cf'].copy()
-    h_cf.append((datetime.now().date(), market_val))
-    try:
-        h_xirr = xirr(h_cf)
-        h_xirr_val = h_xirr * 100 if h_xirr is not None else 0.0
-    except:
-        h_xirr_val = 0.0
-    
     holding_rows.append({
-        "标的代码": code, 
-        "标的名称": info['name'], 
-        "当前市值": market_val,         
-        "持仓本金": info['pure_cost'], 
-        "持仓份额": info['shares'],
-        "购买均价": avg_cost, 
-        "最新单价": current_price, 
-        "累计手续费": info['total_fee'], 
-        "累计分红": info['total_div'],
-        col_today_profit: today_profit,
-        col_today_rate: today_profit_rate,
-        col_yest_profit: yesterday_profit,
-        col_yest_rate: yesterday_profit_rate,
-        "持有收益": holding_profit,      
-        "持有收益率": profit_rate,
-        "总历史收益": total_history_profit, 
-        "总历史收益率": total_history_rate,
-        "日年化收益": annualized_rate,    
-        "XIRR": h_xirr_val,           
-        "TWR": twr,                   
-        "持有时间": f"{days_held}天",     
-        "最大回撤": mdd                
+        "标的代码": code, "标的名称": info['name'], "持仓份额": info['shares'],
+        "购买均价": avg_cost, "最新单价": current_price, "当前市值": market_val,
+        "持仓本金": info['pure_cost'], "累计手续费": info['total_fee'], "累计分红": info['total_div'],
+        "纯持有收益": profit, "收益率": profit_rate, "今日收益": today_profit
     })
 
 cash_flows.append((datetime.now().date(), total_market_value))
@@ -399,7 +274,7 @@ yesterday_market_value = total_market_value - total_today_profit
 today_return_rate = (total_today_profit / yesterday_market_value) * 100 if yesterday_market_value > 0 else 0.0
 
 # ==========================================
-# 6. 渲染看板与报表
+# 5. 渲染看板与报表
 # ==========================================
 st.markdown(f"### 📊 核心指标 {display_title_suffix}")
 col1, col2, col3, col4, col5, col6 = st.columns(6)
@@ -477,45 +352,13 @@ def color_red_green(val):
 st.subheader(f"📊 当前持仓与实时盈亏 {display_title_suffix}")
 if holding_rows:
     df_holdings = pd.DataFrame(holding_rows)
-    df_holdings = df_holdings.sort_values(by="当前市值", ascending=False).reset_index(drop=True)
-    
-    # 动态匹配刚生成的带日期的列名
-    format_dict = {
-        "当前市值": "¥ {:,.2f}",
-        "持仓本金": "¥ {:,.2f}", 
-        "持仓份额": "{:,.2f}", 
-        "购买均价": "{:,.4f}", 
-        "最新单价": "{:,.4f}", 
-        "累计手续费": "¥ {:,.2f}", 
-        "累计分红": "¥ {:,.2f}", 
-        col_today_profit: "¥ {:+.2f}",
-        col_today_rate: "{:+.2f}%",
-        col_yest_profit: "¥ {:+.2f}",
-        col_yest_rate: "{:+.2f}%",
-        "持有收益": "¥ {:+.2f}", 
-        "持有收益率": "{:+.2f}%",
-        "总历史收益": "¥ {:+.2f}", 
-        "总历史收益率": "{:+.2f}%",
-        "日年化收益": "{:+.2f}%",
-        "XIRR": "{:+.2f}%",
-        "TWR": "{:+.2f}%",
-        "最大回撤": "{:.2f}%"
-    }
-    styled_holdings = df_holdings.style.format(format_dict)
-    
-    # 全部核心盈亏指标均应用红绿着色
-    color_cols = [
-        col_today_profit, col_today_rate, 
-        col_yest_profit, col_yest_rate,
-        "持有收益", "持有收益率", 
-        "总历史收益", "总历史收益率", 
-        "日年化收益", "XIRR", "TWR"
-    ]
-    try: 
-        styled_holdings = styled_holdings.map(color_red_green, subset=color_cols)
-    except AttributeError: 
-        styled_holdings = styled_holdings.applymap(color_red_green, subset=color_cols)
-        
+    styled_holdings = df_holdings.style.format({
+        "持仓份额": "{:,.2f}", "购买均价": "{:,.4f}", "最新单价": "{:,.4f}", "当前市值": "¥ {:,.2f}",
+        "持仓本金": "¥ {:,.2f}", "累计手续费": "¥ {:,.2f}", "累计分红": "¥ {:,.2f}", 
+        "纯持有收益": "¥ {:,.2f}", "收益率": "{:+.2f}%", "今日收益": "¥ {:+.2f}"
+    })
+    try: styled_holdings = styled_holdings.map(color_red_green, subset=["纯持有收益", "收益率", "今日收益"])
+    except AttributeError: styled_holdings = styled_holdings.applymap(color_red_green, subset=["纯持有收益", "收益率", "今日收益"])
     st.dataframe(styled_holdings.set_table_styles(center_css), use_container_width=True)
 else:
     st.info("暂无持仓记录")
