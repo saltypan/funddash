@@ -8,19 +8,20 @@ import re
 import time
 
 # ==========================================
-# 0. 本地数据库初始化 (增加时间与资金参数)
+# 0. 本地数据库初始化 (增加定投频率字段)
 # ==========================================
 DB_NAME = "fund_archive.db"
 
 def init_archive_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # 新增了开始时间、结束时间、定投期数、单次金额字段
+    # 新增了 "定投频率" 字段
     c.execute('''
         CREATE TABLE IF NOT EXISTS run_history (
             测算时间 TEXT,
             基金代码 TEXT,
             基金名称 TEXT,
+            定投频率 TEXT,
             开始时间 TEXT,
             结束时间 TEXT,
             定投期数 INTEGER,
@@ -55,8 +56,8 @@ def save_to_archive(df_results):
         "最大回撤": "区间最大回撤"
     })
     
-    # 仅保留数据库支持的列进行保存
-    columns_to_keep = ["测算时间", "基金代码", "基金名称", "开始时间", "结束时间", "定投期数", "单次金额", "累计投入本金", "期末总市值", "绝对收益率", "真实年化_XIRR", "基金涨幅_TWR", "区间最大回撤"]
+    # 仅保留数据库支持的列进行保存 (加入了 定投频率)
+    columns_to_keep = ["测算时间", "基金代码", "基金名称", "定投频率", "开始时间", "结束时间", "定投期数", "单次金额", "累计投入本金", "期末总市值", "绝对收益率", "真实年化_XIRR", "基金涨幅_TWR", "区间最大回撤"]
     db_df = db_df[[col for col in columns_to_keep if col in db_df.columns]]
     
     db_df.to_sql("run_history", conn, if_exists="append", index=False)
@@ -190,7 +191,7 @@ tab1, tab2 = st.tabs(["批量测算与存档", "深度定投策略对比"])
 # TAB 1: 批量测算与存档
 # ==========================================
 with tab1:
-    col_t1_1, col_t1_2 = st.columns([1, 4]) # 调整列宽让表格有更大空间
+    col_t1_1, col_t1_2 = st.columns([1, 4]) 
     with col_t1_1:
         st.subheader("⚙️ 批量参数配置")
         fund_codes_input = st.text_area("输入基金代码 (支持批量粘贴)", value="015453\n110020\n110007", height=120)
@@ -215,6 +216,11 @@ with tab1:
                 status_text = st.empty()
                 results = []
                 
+                # 构建用于显示的频率标签 (例如：每周(周一), 每月(1号))
+                if dca_freq_type == "每日": freq_label = "每日"
+                elif dca_freq_type == "每周": freq_label = f"每周({dca_weekday})"
+                else: freq_label = f"每月({dca_monthday}号)"
+
                 for i, code in enumerate(raw_codes):
                     status_text.text(f"正在抓取并测算: {code} ... ({i+1}/{len(raw_codes)})")
                     f_name, n_data = get_fund_name_and_nav(code)
@@ -222,7 +228,8 @@ with tab1:
                         v_dates = get_valid_dates(n_data, start_date, end_date, dca_freq_type, dca_weekday, dca_monthday)
                         res = simulate_by_dates(n_data, v_dates, dca_amount, start_date, end_date)
                         if res:
-                            res = {"基金代码": code, "基金名称": f_name, **res, "状态": "成功"}
+                            # 在结果字典中加入 "定投频率" 字段
+                            res = {"基金代码": code, "基金名称": f_name, "定投频率": freq_label, **res, "状态": "成功"}
                             results.append(res)
                     progress_bar.progress((i + 1) / len(raw_codes))
                     time.sleep(0.2) 
@@ -230,7 +237,6 @@ with tab1:
                 status_text.success("🎉 批量测算完成！")
                 df_res = pd.DataFrame(results)
                 if not df_res.empty:
-                    # 去除状态列进行保存展示，保留了开始结束时间、单次金额、扣款次数
                     display_df = df_res.drop(columns=["状态"], errors="ignore")
                     save_to_archive(display_df)
                     
@@ -251,15 +257,14 @@ with tab1:
 
     st.divider()
 
-    # --- 存档数据查看区 (支持动态调整) ---
+    # --- 存档数据查看区 ---
     with st.expander("🗄️ 点击查看历史测算存档 (支持实时排序与过滤)", expanded=True):
         history_df = load_archive()
         if history_df.empty:
             st.info("暂无历史测算记录，进行一次测算后即可在这里查看。")
         else:
-            st.markdown("💡 **操作提示**：你可以点击表头进行**排序**，或者将鼠标悬停在列名上点击出现的汉堡图标进行**过滤** (例如过滤出 XIRR > 10% 的记录)。")
+            st.markdown("💡 **操作提示**：你可以点击表头进行**排序**，或者将鼠标悬停在列名上点击出现的汉堡图标进行**过滤**。")
             
-            # 使用更强大的 st.dataframe 配置参数，开启原生列过滤功能
             format_dict = {
                 "单次金额": "¥{:,.2f}",
                 "累计投入本金": "¥{:,.2f}",
@@ -322,7 +327,7 @@ with tab2:
                     e_date = comp_param["end_date"]
                     t_budget = comp_param["total"]
                     
-                    for freq, label in [("每日", "日定投"), ("每周", "周定投 (周一)"), ("每月", "月定投 (1号)")]:
+                    for freq, label in [("每日", "日定投"), ("每周", "周定投(周一)"), ("每月", "月定投(1号)")]:
                         v_dates = get_valid_dates(n_data, comp_start_date, e_date, freq, "周一", 1)
                         if v_dates:
                             dca_amt = t_budget / len(v_dates)
@@ -334,7 +339,7 @@ with tab2:
                     t_times = comp_param["times"]
                     s_amt = comp_param["amount"]
                     
-                    for freq, label in [("每日", "日定投"), ("每周", "周定投 (周一)"), ("每月", "月定投 (1号)")]:
+                    for freq, label in [("每日", "日定投"), ("每周", "周定投(周一)"), ("每月", "月定投(1号)")]:
                         v_dates = get_valid_dates(n_data, comp_start_date, None, freq, "周一", 1, max_count=t_times)
                         if len(v_dates) < t_times:
                             st.warning(f"历史数据不足以支撑 {t_times} 次 {label}，仅测算 {len(v_dates)} 次。")

@@ -1,4 +1,4 @@
-# 更新时间 / 2026-07-28 12:00
+# 更新时间 / 2026-07-28 16:00 
 
 import streamlit as st
 import pandas as pd
@@ -478,6 +478,9 @@ st.subheader(f"📊 当前持仓与实时盈亏 {display_title_suffix}")
 if holding_rows:
     df_holdings = pd.DataFrame(holding_rows)
     df_holdings = df_holdings.sort_values(by="当前市值", ascending=False).reset_index(drop=True)
+    
+    # 【核心修改】：将前两列设置为索引，Streamlit 渲染时会自动将其冻结在左侧
+    df_holdings.set_index(["标的代码", "标的名称"], inplace=True)
     
     # 动态匹配刚生成的带日期的列名
     format_dict = {
