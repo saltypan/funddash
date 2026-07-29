@@ -1,4 +1,4 @@
-# 更新时间 / 2026-07-28 16:00 
+# 更新时间 / 2026-07-28 1:00 
 
 import streamlit as st
 import pandas as pd
@@ -399,7 +399,7 @@ yesterday_market_value = total_market_value - total_today_profit
 today_return_rate = (total_today_profit / yesterday_market_value) * 100 if yesterday_market_value > 0 else 0.0
 
 # ==========================================
-# 5. 渲染看板与报表
+# 6. 渲染看板与报表
 # ==========================================
 st.markdown(f"### 📊 核心指标 {display_title_suffix}")
 col1, col2, col3, col4, col5, col6 = st.columns(6)
